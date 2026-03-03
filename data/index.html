@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESP32-C6 SD Card Manager</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 1rem; max-width: 900px; }
+    fieldset { margin-bottom: 1rem; }
+    input, button { margin: 0.25rem 0.15rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
+    th, td { border-bottom: 1px solid #ddd; padding: 0.45rem; text-align: left; }
+    .mono { font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>ESP32-C6 SD Card Manager</h1>
+  <p id="status">Loading...</p>
+
+  <fieldset>
+    <legend>Wi-Fi Configuration</legend>
+    <button id="scanBtn">Scan Networks</button>
+    <select id="ssidSelect"></select><br>
+    <input id="ssid" placeholder="SSID">
+    <input id="password" placeholder="Password" type="password">
+    <button id="saveWifi">Save Wi-Fi & Reboot</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>SD Browser</legend>
+    <label>Current path:</label>
+    <input id="path" class="mono" value="/" />
+    <button id="refresh">Refresh</button><br>
+
+    <input id="newDir" placeholder="new-folder-name">
+    <button id="mkdir">Create Folder</button><br>
+
+    <input id="upload" type="file" multiple>
+    <button id="uploadBtn">Upload</button>
+
+    <table>
+      <thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Actions</th></tr></thead>
+      <tbody id="files"></tbody>
+    </table>
+  </fieldset>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const filesEl = document.getElementById('files');
+    const pathEl = document.getElementById('path');
+    const ssidEl = document.getElementById('ssid');
+    const passEl = document.getElementById('password');
+    const ssidSelect = document.getElementById('ssidSelect');
+
+    async function jfetch(url, opts) {
+      const r = await fetch(url, opts);
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    }
+
+    async function refreshStatus() {
+      const st = await jfetch('/api/status');
+      statusEl.textContent = `Mode: ${st.mode.toUpperCase()} | SSID: ${st.ssid} | IP: ${st.ip}`;
+      const w = await jfetch('/api/wifi');
+      ssidEl.value = w.ssid || '';
+    }
+
+    function joinPath(base, name) {
+      if (base === '/') return `/${name}`;
+      return `${base}/${name}`;
+    }
+
+    async function listFiles() {
+      const path = pathEl.value || '/';
+      const data = await jfetch(`/api/files?path=${encodeURIComponent(path)}`);
+      filesEl.innerHTML = '';
+
+      if (path !== '/') {
+        const up = path.split('/').slice(0, -1).join('/') || '/';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td class="mono">..</td><td>dir</td><td>0</td><td><button>Open</button></td>`;
+        tr.querySelector('button').onclick = () => { pathEl.value = up; listFiles(); };
+        filesEl.appendChild(tr);
+      }
+
+      for (const e of data.entries) {
+        const full = e.name;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="mono">${full}</td>
+          <td>${e.type}</td>
+          <td>${e.size}</td>
+          <td></td>
+        `;
+        const actions = tr.children[3];
+
+        if (e.type === 'dir') {
+          const open = document.createElement('button');
+          open.textContent = 'Open';
+          open.onclick = () => {
+            pathEl.value = joinPath(path, full.replace(/^\//, ''));
+            listFiles();
+          };
+          actions.appendChild(open);
+        } else {
+          const dl = document.createElement('a');
+          dl.textContent = 'Download';
+          dl.href = `/api/download?path=${encodeURIComponent(joinPath(path, full.replace(/^\//, '')))}`;
+          dl.style.marginRight = '0.5rem';
+          actions.appendChild(dl);
+        }
+
+        const del = document.createElement('button');
+        del.textContent = 'Delete';
+        del.onclick = async () => {
+          if (!confirm(`Delete ${full}?`)) return;
+          await fetch(`/api/file?path=${encodeURIComponent(joinPath(path, full.replace(/^\//, '')))}`, { method: 'DELETE' });
+          listFiles();
+        };
+        actions.appendChild(del);
+        filesEl.appendChild(tr);
+      }
+    }
+
+    document.getElementById('refresh').onclick = listFiles;
+
+    document.getElementById('mkdir').onclick = async () => {
+      const name = document.getElementById('newDir').value.trim();
+      if (!name) return;
+      await fetch('/api/mkdir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `path=${encodeURIComponent(joinPath(pathEl.value, name))}`
+      });
+      listFiles();
+    };
+
+    document.getElementById('uploadBtn').onclick = async () => {
+      const files = document.getElementById('upload').files;
+      if (!files.length) return;
+      for (const file of files) {
+        const fd = new FormData();
+        fd.append('file', file, file.name);
+        await fetch(`/api/upload?path=${encodeURIComponent(pathEl.value)}`, {
+          method: 'POST',
+          body: fd
+        });
+      }
+      listFiles();
+    };
+
+    document.getElementById('saveWifi').onclick = async () => {
+      const body = `ssid=${encodeURIComponent(ssidEl.value)}&password=${encodeURIComponent(passEl.value)}`;
+      await fetch('/api/wifi', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body
+      });
+      alert('Saved. Device is rebooting. Reconnect and reload page.');
+    };
+
+    document.getElementById('scanBtn').onclick = async () => {
+      const res = await jfetch('/api/scan');
+      ssidSelect.innerHTML = '<option value="">-- choose network --</option>';
+      for (const net of res.networks) {
+        const opt = document.createElement('option');
+        opt.value = net.ssid;
+        opt.textContent = `${net.ssid} (${net.rssi} dBm)`;
+        ssidSelect.appendChild(opt);
+      }
+    };
+
+    ssidSelect.onchange = () => {
+      if (ssidSelect.value) ssidEl.value = ssidSelect.value;
+    };
+
+    (async () => {
+      await refreshStatus();
+      await listFiles();
+    })().catch(err => {
+      statusEl.textContent = `Error: ${err.message}`;
+    });
+  </script>
+</body>
+</html>
